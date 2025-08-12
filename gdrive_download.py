@@ -36,34 +36,41 @@ class ProgressTracker:
     def update_file(self, filename: str, file_size: int = 0):
         with self.lock:
             self.current_file = filename
-            self.current_file_size = file_size
+            self.current_file_size = max(0, file_size)  # Ensure non-negative
             self.current_downloaded = 0
-            self.total_bytes += file_size
+            if file_size > 0:
+                self.total_bytes += file_size
     
     def update_progress(self, downloaded: int):
         with self.lock:
-            old_downloaded = self.current_downloaded
-            self.current_downloaded = downloaded
-            self.downloaded_bytes += (downloaded - old_downloaded)
+            # Only update if downloaded amount makes sense
+            if downloaded >= 0 and downloaded <= self.current_file_size:
+                old_downloaded = self.current_downloaded
+                self.current_downloaded = downloaded
+                # Only add positive progress
+                if downloaded > old_downloaded:
+                    self.downloaded_bytes += (downloaded - old_downloaded)
     
     def complete_file(self):
         with self.lock:
             self.completed_files += 1
-            if not self.quiet:
-                print(f"\rCompleted: {self.current_file}")
+            # Don't print "Completed" message to avoid interference with progress display
     
     def get_speed(self) -> float:
         elapsed = time.time() - self.start_time
-        if elapsed > 0:
+        if elapsed > 1:  # Avoid division by very small numbers
             return self.downloaded_bytes / elapsed
         return 0
     
     def get_eta(self) -> str:
         speed = self.get_speed()
-        if speed > 0:
-            remaining_bytes = self.total_bytes - self.downloaded_bytes
+        if speed > 0 and self.total_bytes > 0:
+            remaining_bytes = max(0, self.total_bytes - self.downloaded_bytes)
             eta_seconds = remaining_bytes / speed
-            if eta_seconds < 60:
+            
+            if eta_seconds < 0:
+                return "0s"
+            elif eta_seconds < 60:
                 return f"{eta_seconds:.0f}s"
             elif eta_seconds < 3600:
                 return f"{eta_seconds/60:.0f}m {eta_seconds%60:.0f}s"
@@ -71,7 +78,7 @@ class ProgressTracker:
                 hours = eta_seconds // 3600
                 minutes = (eta_seconds % 3600) // 60
                 return f"{hours:.0f}h {minutes:.0f}m"
-        return "unknown"
+        return "--"
     
     def format_size(self, bytes_val: int) -> str:
         for unit in ['B', 'KB', 'MB', 'GB']:
@@ -87,27 +94,34 @@ class ProgressTracker:
         with self.lock:
             if self.total_files == 0:
                 return
-                
-            # File progress
-            file_percent = (self.completed_files / self.total_files) * 100
             
-            # Current file progress
+            # Current file progress - only show if file size is known
             current_percent = 0
-            if self.current_file_size > 0:
-                current_percent = (self.current_downloaded / self.current_file_size) * 100
+            if self.current_file_size > 0 and self.current_downloaded <= self.current_file_size:
+                current_percent = min(100.0, (self.current_downloaded / self.current_file_size) * 100)
             
             # Speed and ETA
             speed = self.get_speed()
             eta = self.get_eta()
             
             # Create progress line without progress bar
-            progress_line = (
-                f"\r{current_percent:5.1f}% "
-                f"({self.completed_files}/{self.total_files}) "
-                f"{self.format_size(speed)}/s "
-                f"ETA: {eta} "
-                f"{self.current_file[:50]}"
-            )
+            if self.current_file_size > 0:
+                # Show file progress
+                progress_line = (
+                    f"\r{current_percent:5.1f}% "
+                    f"({self.completed_files}/{self.total_files}) "
+                    f"{self.format_size(speed)}/s "
+                    f"ETA: {eta} "
+                    f"{self.current_file[:50]}"
+                )
+            else:
+                # Show only file count progress for files with unknown size
+                progress_line = (
+                    f"\r({self.completed_files}/{self.total_files}) "
+                    f"{self.format_size(speed)}/s "
+                    f"ETA: {eta} "
+                    f"{self.current_file[:60]}"
+                )
             
             # Clear line and print progress
             print(progress_line.ljust(100), end='', flush=True)
@@ -208,8 +222,13 @@ class GDrive:
                     total_size += sub_size
             else:
                 count += 1
-                file_size = int(item.get('size', 0)) if item.get('size') else 0
-                total_size += file_size
+                # Safely handle file size
+                try:
+                    file_size = int(item.get('size', 0)) if item.get('size') else 0
+                    total_size += max(0, file_size)  # Ensure non-negative
+                except (ValueError, TypeError):
+                    # Skip if size is not a valid number
+                    pass
         
         return count, total_size
 
@@ -301,8 +320,10 @@ class GDrive:
                 done = False
                 while done is False:
                     status, done = downloader.next_chunk()
-                    if status and self.progress_tracker:
-                        downloaded = int(status.resumable_progress * file_size) if file_size > 0 else 0
+                    if status and self.progress_tracker and file_size > 0:
+                        # Calculate downloaded bytes more safely
+                        progress_ratio = min(1.0, max(0.0, status.resumable_progress))
+                        downloaded = int(progress_ratio * file_size)
                         self.progress_tracker.update_progress(downloaded)
                         self.progress_tracker.display_progress()
             
@@ -311,6 +332,9 @@ class GDrive:
             
             if self.progress_tracker:
                 self.progress_tracker.complete_file()
+                # Clear progress line and show completion
+                if not self.progress_tracker.quiet:
+                    print(f"\r{' ' * 100}\r{file_name}", flush=True)
             
             return True
             
@@ -423,28 +447,6 @@ class GDrive:
             print(f"Total size: {self.progress_tracker.format_size(self.progress_tracker.downloaded_bytes)}")
             print(f"Time elapsed: {elapsed_time:.1f}s")
             print(f"Average speed: {self.progress_tracker.format_size(avg_speed)}/s")
-
-class ProgressDisplay:
-    def __init__(self, progress_tracker: ProgressTracker):
-        self.progress_tracker = progress_tracker
-        self.running = False
-        self.thread = None
-    
-    def start(self):
-        if not self.progress_tracker.quiet and not self.progress_tracker.no_progress:
-            self.running = True
-            self.thread = threading.Thread(target=self._display_loop, daemon=True)
-            self.thread.start()
-    
-    def stop(self):
-        self.running = False
-        if self.thread:
-            self.thread.join(timeout=1)
-    
-    def _display_loop(self):
-        while self.running:
-            self.progress_tracker.display_progress()
-            time.sleep(0.5)
 
 def main():
     parser = argparse.ArgumentParser(
