@@ -100,18 +100,13 @@ class ProgressTracker:
             speed = self.get_speed()
             eta = self.get_eta()
             
-            # Progress bar for current file
-            bar_width = 30
-            filled = int((current_percent / 100) * bar_width)
-            bar = '█' * filled + '░' * (bar_width - filled)
-            
-            # Create progress line
+            # Create progress line without progress bar
             progress_line = (
-                f"\r[{bar}] {current_percent:5.1f}% "
+                f"\r{current_percent:5.1f}% "
                 f"({self.completed_files}/{self.total_files}) "
                 f"{self.format_size(speed)}/s "
                 f"ETA: {eta} "
-                f"{self.current_file[:40]}"
+                f"{self.current_file[:50]}"
             )
             
             # Clear line and print progress
