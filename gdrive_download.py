@@ -3,6 +3,8 @@ import sys
 import argparse
 import re
 import json
+import time
+import threading
 from pathlib import Path
 from typing import List, Dict, Optional
 
@@ -17,13 +19,110 @@ except ImportError:
 
 SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
 
+class ProgressTracker:
+    def __init__(self, total_files: int, quiet: bool = False, no_progress: bool = False):
+        self.total_files = total_files
+        self.completed_files = 0
+        self.current_file = ""
+        self.current_file_size = 0
+        self.current_downloaded = 0
+        self.start_time = time.time()
+        self.total_bytes = 0
+        self.downloaded_bytes = 0
+        self.quiet = quiet
+        self.no_progress = no_progress
+        self.lock = threading.Lock()
+        
+    def update_file(self, filename: str, file_size: int = 0):
+        with self.lock:
+            self.current_file = filename
+            self.current_file_size = file_size
+            self.current_downloaded = 0
+            self.total_bytes += file_size
+    
+    def update_progress(self, downloaded: int):
+        with self.lock:
+            old_downloaded = self.current_downloaded
+            self.current_downloaded = downloaded
+            self.downloaded_bytes += (downloaded - old_downloaded)
+    
+    def complete_file(self):
+        with self.lock:
+            self.completed_files += 1
+            if not self.quiet:
+                print(f"\rCompleted: {self.current_file}")
+    
+    def get_speed(self) -> float:
+        elapsed = time.time() - self.start_time
+        if elapsed > 0:
+            return self.downloaded_bytes / elapsed
+        return 0
+    
+    def get_eta(self) -> str:
+        speed = self.get_speed()
+        if speed > 0:
+            remaining_bytes = self.total_bytes - self.downloaded_bytes
+            eta_seconds = remaining_bytes / speed
+            if eta_seconds < 60:
+                return f"{eta_seconds:.0f}s"
+            elif eta_seconds < 3600:
+                return f"{eta_seconds/60:.0f}m {eta_seconds%60:.0f}s"
+            else:
+                hours = eta_seconds // 3600
+                minutes = (eta_seconds % 3600) // 60
+                return f"{hours:.0f}h {minutes:.0f}m"
+        return "unknown"
+    
+    def format_size(self, bytes_val: int) -> str:
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if bytes_val < 1024:
+                return f"{bytes_val:.1f}{unit}"
+            bytes_val /= 1024
+        return f"{bytes_val:.1f}TB"
+    
+    def display_progress(self):
+        if self.quiet or self.no_progress:
+            return
+            
+        with self.lock:
+            if self.total_files == 0:
+                return
+                
+            # File progress
+            file_percent = (self.completed_files / self.total_files) * 100
+            
+            # Current file progress
+            current_percent = 0
+            if self.current_file_size > 0:
+                current_percent = (self.current_downloaded / self.current_file_size) * 100
+            
+            # Speed and ETA
+            speed = self.get_speed()
+            eta = self.get_eta()
+            
+            # Progress bar for current file
+            bar_width = 30
+            filled = int((current_percent / 100) * bar_width)
+            bar = '█' * filled + '░' * (bar_width - filled)
+            
+            # Create progress line
+            progress_line = (
+                f"\r[{bar}] {current_percent:5.1f}% "
+                f"({self.completed_files}/{self.total_files}) "
+                f"{self.format_size(speed)}/s "
+                f"ETA: {eta} "
+                f"{self.current_file[:40]}"
+            )
+            
+            # Clear line and print progress
+            print(progress_line.ljust(100), end='', flush=True)
+
 class GDrive:
     def __init__(self):
         self.config_dir = Path.home() / '.gdrive'
         self.config_file = self.config_dir / 'config.json'
         self.service = None
-        self.downloaded_count = 0
-        self.total_count = 0
+        self.progress_tracker = None
         
     def configure(self):
         self.config_dir.mkdir(exist_ok=True)
@@ -101,16 +200,23 @@ class GDrive:
         else:
             print("Specify folder ID or URL")
 
-    def count_files(self, folder_id: str, recursive: bool) -> int:
+    def count_files_and_size(self, folder_id: str, recursive: bool) -> tuple[int, int]:
         count = 0
+        total_size = 0
         items = self.get_folder_items(folder_id)
+        
         for item in items:
             if item['mimeType'] == 'application/vnd.google-apps.folder':
                 if recursive:
-                    count += self.count_files(item['id'], recursive)
+                    sub_count, sub_size = self.count_files_and_size(item['id'], recursive)
+                    count += sub_count
+                    total_size += sub_size
             else:
                 count += 1
-        return count
+                file_size = int(item.get('size', 0)) if item.get('size') else 0
+                total_size += file_size
+        
+        return count, total_size
 
     def sanitize_name(self, name: str) -> str:
         # Remove or replace invalid characters for file systems
@@ -176,6 +282,17 @@ class GDrive:
             output_dir.mkdir(parents=True, exist_ok=True)
             file_path = output_dir / file_name
             
+            # Get file size for progress tracking
+            try:
+                file_info = self.service.files().get(fileId=file_id, fields="size").execute()
+                file_size = int(file_info.get('size', 0)) if file_info.get('size') else 0
+            except:
+                file_size = 0
+            
+            # Update progress tracker
+            if self.progress_tracker:
+                self.progress_tracker.update_file(file_name, file_size)
+            
             # Create temporary file path
             temp_path = file_path.with_suffix(file_path.suffix + '.tmp')
             
@@ -183,21 +300,27 @@ class GDrive:
             if file_path.exists():
                 file_path.unlink()
             
-            # Download to temporary file
+            # Download to temporary file with progress tracking
             with open(temp_path, 'wb') as fh:
                 downloader = MediaIoBaseDownload(fh, request)
                 done = False
                 while done is False:
                     status, done = downloader.next_chunk()
+                    if status and self.progress_tracker:
+                        downloaded = int(status.resumable_progress * file_size) if file_size > 0 else 0
+                        self.progress_tracker.update_progress(downloaded)
+                        self.progress_tracker.display_progress()
             
             # Rename temp file to final name
             temp_path.rename(file_path)
             
-            self.downloaded_count += 1
+            if self.progress_tracker:
+                self.progress_tracker.complete_file()
+            
             return True
             
         except Exception as e:
-            # Clean up temp file if it exists (FIXED)
+            # Clean up temp file if it exists
             if temp_path and temp_path.exists():
                 try:
                     temp_path.unlink()
@@ -207,7 +330,8 @@ class GDrive:
             if 'File not found' in str(e):
                 return False
             else:
-                print(f"Failed to download {file_name}: {e}")
+                if not (self.progress_tracker and self.progress_tracker.quiet):
+                    print(f"\nFailed to download {file_name}: {e}")
                 return False
 
     def cp_folder(self, folder_id: str, local_dir: Path, recursive: bool, current_path: str = "") -> None:
@@ -222,16 +346,15 @@ class GDrive:
                     self.cp_folder(item['id'], local_dir, recursive, sub_path)
             else:
                 file_path = local_dir / current_path if current_path else local_dir
-                if self.download_file(item['id'], name, item['mimeType'], file_path):
-                    print(f"{name}")
+                self.download_file(item['id'], name, item['mimeType'], file_path)
 
     def get_file_info(self, file_id: str) -> Optional[Dict]:
         try:
-            return self.service.files().get(fileId=file_id, fields="id, name, mimeType").execute()
+            return self.service.files().get(fileId=file_id, fields="id, name, mimeType, size").execute()
         except:
             return None
 
-    def cp(self, source: str, destination: str, recursive: bool = False) -> None:
+    def cp(self, source: str, destination: str, recursive: bool = False, quiet: bool = False, no_progress: bool = False) -> None:
         self.authenticate()
         
         if source.startswith('http'):
@@ -251,14 +374,29 @@ class GDrive:
             return
         
         if item_info['mimeType'] == 'application/vnd.google-apps.folder':
-            # Folder
-            self.total_count = self.count_files(item_id, recursive)
-            if self.total_count == 0:
+            # Folder - count files first for progress tracking
+            if not quiet:
+                print("Scanning folder structure...")
+            
+            total_files, total_size = self.count_files_and_size(item_id, recursive)
+            
+            if total_files == 0:
                 print("No files to copy")
                 return
+            
+            # Initialize progress tracker
+            self.progress_tracker = ProgressTracker(total_files, quiet, no_progress)
+            
+            if not quiet:
+                print(f"Found {total_files} files ({self.progress_tracker.format_size(total_size)})")
+                print("Starting download...")
+            
             self.cp_folder(item_id, local_path, recursive)
+            
         else:
             # Single file
+            self.progress_tracker = ProgressTracker(1, quiet, no_progress)
+            
             original_name = self.sanitize_name(item_info['name'])
             
             # If destination ends with / or \, treat as directory
@@ -278,22 +416,67 @@ class GDrive:
                 output_dir = local_path.parent
                 output_file = local_path.name
             
-            if self.download_file(item_id, output_file, item_info['mimeType'], output_dir):
-                print(f"{output_file}")
+            self.download_file(item_id, output_file, item_info['mimeType'], output_dir)
+        
+        # Final summary
+        if self.progress_tracker and not quiet:
+            elapsed_time = time.time() - self.progress_tracker.start_time
+            avg_speed = self.progress_tracker.get_speed()
+            
+            print(f"\n\nDownload completed!")
+            print(f"Files: {self.progress_tracker.completed_files}/{self.progress_tracker.total_files}")
+            print(f"Total size: {self.progress_tracker.format_size(self.progress_tracker.downloaded_bytes)}")
+            print(f"Time elapsed: {elapsed_time:.1f}s")
+            print(f"Average speed: {self.progress_tracker.format_size(avg_speed)}/s")
+
+class ProgressDisplay:
+    def __init__(self, progress_tracker: ProgressTracker):
+        self.progress_tracker = progress_tracker
+        self.running = False
+        self.thread = None
+    
+    def start(self):
+        if not self.progress_tracker.quiet and not self.progress_tracker.no_progress:
+            self.running = True
+            self.thread = threading.Thread(target=self._display_loop, daemon=True)
+            self.thread.start()
+    
+    def stop(self):
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=1)
+    
+    def _display_loop(self):
+        while self.running:
+            self.progress_tracker.display_progress()
+            time.sleep(0.5)
 
 def main():
-    parser = argparse.ArgumentParser(prog='gdrive')
-    subparsers = parser.add_subparsers(dest='command')
+    parser = argparse.ArgumentParser(
+        prog='gdrive',
+        description='Google Drive command line tool with progress display'
+    )
+    subparsers = parser.add_subparsers(dest='command', help='Available commands')
     
-    subparsers.add_parser('configure')
+    # Configure command
+    subparsers.add_parser('configure', help='Configure authentication')
     
-    ls_parser = subparsers.add_parser('ls')
+    # List command
+    ls_parser = subparsers.add_parser('ls', help='List files and folders')
     ls_parser.add_argument('path', nargs='?', help='Folder ID or URL')
     
-    cp_parser = subparsers.add_parser('cp')
+    # Copy command
+    cp_parser = subparsers.add_parser('cp', help='Copy files/folders from Drive')
     cp_parser.add_argument('source', help='Drive folder ID or URL')
     cp_parser.add_argument('destination', help='Local directory')
-    cp_parser.add_argument('-r', '--recursive', action='store_true')
+    cp_parser.add_argument('-r', '--recursive', action='store_true', 
+                          help='Copy folders recursively')
+    cp_parser.add_argument('--quiet', action='store_true', 
+                          help='Suppress all output except errors')
+    cp_parser.add_argument('--no-progress', action='store_true', 
+                          help='Disable progress display but show completion messages')
+    cp_parser.add_argument('--progress', action='store_true', 
+                          help='Force enable progress display (default)')
     
     args = parser.parse_args()
     
@@ -304,7 +487,13 @@ def main():
     elif args.command == 'ls':
         gdrive.ls(args.path)
     elif args.command == 'cp':
-        gdrive.cp(args.source, args.destination, args.recursive)
+        # Handle conflicting options
+        quiet = args.quiet
+        no_progress = args.no_progress
+        if args.progress:
+            no_progress = False
+        
+        gdrive.cp(args.source, args.destination, args.recursive, quiet, no_progress)
     else:
         parser.print_help()
 
