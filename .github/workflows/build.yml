@@ -31,3 +31,28 @@ jobs:
       with:
         name: GD-${{ matrix.os }}
         path: dist/GD*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+    
+    - name: Get date and short SHA
+      id: vars
+      run: |
+        echo "date=$(date +'%Y%m%d')" >> $GITHUB_OUTPUT
+        echo "sha_short=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+    
+    - name: Create release with binaries
+      uses: softprops/action-gh-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.vars.outputs.date }}-${{ steps.vars.outputs.sha_short }}
+        name: Release ${{ steps.vars.outputs.date }}-${{ steps.vars.outputs.sha_short }}
+        files: |
+          GD-ubuntu-latest/GD
+          GD-windows-latest/GD.exe
