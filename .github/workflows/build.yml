@@ -1,0 +1,33 @@
+name: Build GD Binary
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+    - uses: actions/checkout@v4
+    
+    - uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        pip install pyinstaller google-api-python-client google-auth
+
+    - name: Build binary
+      run: |
+        pyinstaller --onefile --name GD gdrive_download.py
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: GD-${{ matrix.os }}
+        path: dist/GD*
